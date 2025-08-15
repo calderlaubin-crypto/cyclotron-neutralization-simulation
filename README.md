@@ -1,3 +1,4 @@
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.16884279.svg)](https://doi.org/10.5281/zenodo.16884279)
 # Cyclotron-Maintained Space-Charge Neutralization PIC Simulation
 
 This repository contains a 2D electrostatic Particle-in-Cell (PIC) simulation for studying **cyclotron-maintained space‑charge neutralization** in an electron-positron beam system.
