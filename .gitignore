@@ -1,0 +1,14 @@
+# Ignore Python cache files
+__pycache__/
+*.pyc
+
+# Ignore generated plots and data
+plots/
+*.png
+*.jpg
+*.jpeg
+*.gif
+
+# Ignore OS-specific files
+.DS_Store
+Thumbs.db
