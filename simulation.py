@@ -1,9 +1,11 @@
 # Full PIC script with magnetized/unmagnetized toggle, robust baselines,
 
+
 import numpy as np
 import matplotlib.pyplot as plt
 import os
 from scipy.ndimage import gaussian_filter
+from scipy.optimize import curve_fit
 np.random.seed(12345678)
 # -------------------- Physical constants --------------------
 e  = 1.602176634e-19
@@ -11,7 +13,7 @@ me = 9.10938356e-31
 e0 = 8.8541878128e-12
 c  = 299792458.0
 kB = 1.380649e-23
-
+mu0 = 4 * np.pi * 1e-7  # magnetic permeability of free space [H/m]
 # -------------------- Tunable physics targets --------------------
 # Domain and grid
 Lx = 1.0e-3     # 1 mm square cross-section
@@ -27,7 +29,7 @@ ne_p  = 6.9e16   # positron neutralizer density (set equal for ideal cancellatio
 vz_e = 2.4e8
 vz_p = 2.4e8
 
-# Magnetic field: toggle here. Set to 0.0 for unmagnetized, >0 for magnetized.
+# Magnetic field: toggle here. Set to 0.0 for unmagnetized, 2 for our magnetized value.
 Bz = 2.0   # Tesla Set Bz = 0.0 for unmag case.
 
 # Thermal spreads to set a finite Debye length (this improves PIC stability)
@@ -212,28 +214,51 @@ def gather_field(sp, Ex, Ey):
    Eyp = (Ey[i0,j0]*(1-tx)*(1-ty) + Ey[i1,j0]*tx*(1-ty) + Ey[i0,j1]*(1-tx)*ty + Ey[i1,j1]*tx*ty)
    return Exp, Eyp
 
-def boris_push(sp, Ex, Ey):
-   """Boris mover including Bz rotation (works for Bz=0 as well)."""
-   q = sp['q']; m = sp['m']
-   vx, vy = sp['vx'], sp['vy']
-   Exp, Eyp = gather_field(sp, Ex, Ey)
-   # half electric kick
-   vxm = vx + (q*Exp/m)*(0.5*dt)
-   vym = vy + (q*Eyp/m)*(0.5*dt)
-   # magnetic rotation around z (handles Bz=0)
-   t = (q*Bz/m)*(0.5*dt)
-   s = 2*t/(1+t**2)
-   # rotation formula (z-only)
-   vxp = vxm + vym * t
-   vyp = vym - vxm * t
-   vxn = vxp + vyp * s
-   vyn = vyp - vxp * s
-   # final half electric kick
-   sp['vx'] = vxn + (q*Exp/m)*(0.5*dt)
-   sp['vy'] = vyn + (q*Eyp/m)*(0.5*dt)
-   # advance positions
-   sp['x'] = (sp['x'] + sp['vx']*dt) % Lx
-   sp['y'] = (sp['y'] + sp['vy']*dt) % Ly
+def boris_push_relativistic(sp, Ex, Ey):
+    """Relativistic Boris pusher with magnetic field Bz (works for Bz=0 too)."""
+    q = sp['q']; m = sp['m']
+    vx, vy, vz = sp['vx'], sp['vy'], sp['vz']
+    Exp, Eyp = gather_field(sp, Ex, Ey)
+    Bz_local = Bz  # uniform field
+
+    # Compute gamma per particle
+    v2 = vx**2 + vy**2 + vz**2
+    gamma = 1.0 / np.sqrt(1.0 - v2 / c**2)
+
+    # Half electric impulse (momentum)
+    px = gamma * m * vx + q * Exp * 0.5 * dt
+    py = gamma * m * vy + q * Eyp * 0.5 * dt
+    pz = gamma * m * vz  # E field has no z component in this 2D setup
+
+    # Magnetic rotation (momentum rotation about z)
+    # Use t and s vectors as in standard relativistic Boris
+    t_z = (q * Bz_local / m) * (0.5 * dt / gamma)
+    s_z = 2 * t_z / (1 + t_z**2)
+
+    p_minus_x = px
+    p_minus_y = py
+
+    # rotate in xy-plane
+    p_prime_x = p_minus_x + p_minus_y * t_z
+    p_prime_y = p_minus_y - p_minus_x * t_z
+
+    px_new = p_minus_x + p_prime_y * s_z
+    py_new = p_minus_y - p_prime_x * s_z
+
+    # second half electric kick
+    px_new += q * Exp * 0.5 * dt
+    py_new += q * Eyp * 0.5 * dt
+
+    # update velocity and gamma
+    p2 = px_new**2 + py_new**2 + pz**2
+    gamma_new = np.sqrt(1.0 + p2 / (m**2 * c**2))
+    sp['vx'] = px_new / (gamma_new * m)
+    sp['vy'] = py_new / (gamma_new * m)
+    sp['vz'] = pz / (gamma_new * m)
+
+    # advance positions with new velocities
+    sp['x'] = (sp['x'] + sp['vx'] * dt) % Lx
+    sp['y'] = (sp['y'] + sp['vy'] * dt) % Ly
 
 def rho_from_single(sp):
    return deposit_rho([sp])
@@ -333,7 +358,7 @@ for it in range(steps):
 
    # advance particles
    for sp in species_list:
-       boris_push(sp, Ex, Ey)
+       boris_push_relativistic(sp, Ex, Ey)
 
    # diagnostics snapshot
    if it % snap_every == 0 or it == steps-1:
@@ -372,6 +397,41 @@ for it in range(steps):
 
        print(f"Step {it}/{steps} — eta_charge={eta:.4f}, E_rms={Erms:.3e}, "
              f"O={O:.3f}, KE={KE:.3e}, FE={FE:.3e}, TE={TE:.3e}, dE_rel={dE_rel:.2e}")
+# Simple conservative estimate of local self-B (line-current model)
+# compute local cell current density Jz (A/m^2) from species deposits
+def estimate_local_B_self():
+    # deposit J_z to cell centers
+    Jz = np.zeros((Nx, Ny))
+    for sp in species_list:
+        # particle contributions to current density Jz = q * n_particle * vz
+        # each macro contributes current = q * w * vz / cell_volume
+        q = sp['q']; vz_arr = sp['vz']; w = sp['w']
+        # deposit using identical CIC as for charge but weighted by vz
+        # (quick approximate approach: deposit charge then multiply by mean vz)
+        # Here we construct per-particle current and deposit like deposit_rho
+        gx = sp['x']/dx; gy = sp['y']/dy
+        i0 = np.floor(gx).astype(int) % Nx
+        j0 = np.floor(gy).astype(int) % Ny
+        tx = gx - i0; ty = gy - j0
+        i1 = (i0+1)%Nx; j1 = (j0+1)%Ny
+        charge_macro = q * w  # coulombs per macro
+        current_macro = charge_macro * vz_arr  # coulomb*m/s per macro
+        w00 = (1-tx)*(1-ty); w10 = tx*(1-ty); w01 = (1-tx)*ty; w11 = tx*ty
+        np.add.at(Jz, (i0,j0), current_macro * w00)
+        np.add.at(Jz, (i1,j0), current_macro * w10)
+        np.add.at(Jz, (i0,j1), current_macro * w01)
+        np.add.at(Jz, (i1,j1), current_macro * w11)
+    # convert to current density A/m^2: divide by cell area*Lz
+    Jz /= (cell_area * Lz)
+    # convert to local line current by multiplying by cell width ~ dx
+    I_cell = np.max(np.abs(Jz)) * dx  # A per cell (conservative)
+    # estimate B at radius r ~ dx using line-current formula B ~ mu0 * I /(2π r)
+    r_est = dx
+    B_est = mu0 * I_cell / (2.0 * np.pi * max(r_est, 1e-12))
+    return I_cell, B_est
+
+I_cell, B_est = estimate_local_B_self()
+print(f"Max cell current ~ {I_cell:.3e} A, estimated B_self ~ {B_est:.3e} T, Bz={Bz:.3e} T")
 
 # -------------------- Final diagnostics/plots --------------------
 rho_final = deposit_rho(species_list)
@@ -382,6 +442,168 @@ E_mag = np.sqrt(Ex_f**2 + Ey_f**2)
 rho_b_final = deposit_rho([Positrons])
 rho_e_final = deposit_rho([Electrons])
 np.savez('dumps/final_species_rho_mag.npz', rho_b=rho_b_final, rho_e=rho_e_final, rho_net=rho_final, Ex=Ex_f, Ey=Ey_f)
+
+# Save timeseries arrays to a npz for post-processing
+np.savez('dumps/timeseries.npz',
+         eta_hist=np.array(eta_hist), eta_raw_hist=np.array(eta_raw_hist),
+         Erms_hist=np.array(Erms_hist), rho_rms_hist=np.array(rho_rms_hist), overlap_hist=np.array(overlap_hist),
+         KE_hist=np.array(KE_hist), FE_hist=np.array(FE_hist), TE_hist=np.array(TE_hist),
+         dE_rel_hist=np.array(dE_rel_hist))
+
+# Recover snapshot cadence: snap_every to store snapshots.
+# Build a time axis consistent with snapshots stored in histories:
+try:
+    dt  
+    snap_every
+    steps
+except NameError:
+    # If not available, user should set them appropriately
+    raise RuntimeError("dt and snap_every must be present in the script namespace.")
+
+# Build time vector for snapshots saved to histories
+# So number of snapshots = len(Erms_hist)
+n_snap = len(Erms_hist)
+# first snapshot was at it=0, next at it=snap_every, etc. Last snapshot may be steps-1
+# construct times using the indices where snapshots would occur:
+snapshot_indices = list(range(0, steps, snap_every))
+if snapshot_indices[-1] != steps-1 and len(snapshot_indices) < n_snap:
+    # fallback: assume evenly spaced
+    snapshot_indices = np.linspace(0, steps-1, n_snap, dtype=int).tolist()
+elif len(snapshot_indices) > n_snap:
+    snapshot_indices = snapshot_indices[:n_snap]
+elif len(snapshot_indices) < n_snap:
+    # pad to match n_snap using linspace
+    snapshot_indices = np.linspace(0, steps-1, n_snap, dtype=int).tolist()
+
+t_snap = np.array(snapshot_indices, dtype=float) * dt  # seconds
+
+# Convert lists to arrays (in case)
+E_rms_arr   = np.array(Erms_hist)
+rho_rms_arr = np.array(rho_rms_hist)
+eta_arr     = np.array(eta_hist)
+overlap_arr = np.array(overlap_hist)
+
+# Save raw timeseries for reproducibility
+np.savez('dumps/timeseries_diagnostics_saved.npz',
+         t=t_snap, E_rms=E_rms_arr, rho_rms=rho_rms_arr, eta=eta_arr,
+         overlap=overlap_arr, Erms_hist=E_rms_arr, rho_rms_hist=rho_rms_arr,
+         eta_hist=eta_arr, overlap_hist=overlap_arr)
+
+# --- Fitting models ---
+def exp_decay(t, A, gamma, C):
+    return A * np.exp(-gamma * t) + C
+
+def rise_to_plateau(t, eta_inf, eta0, gamma_eta):
+    return eta_inf - (eta_inf - eta0) * np.exp(-gamma_eta * t)
+
+# Provide reasonable initial guesses
+def safe_guess_exp(data, t):
+    A0 = data[0] - data[-1]
+    if A0 == 0:
+        A0 = np.max(data) - np.min(data)
+    C0 = data[-1]
+    gamma0 = 1.0 / max((t[-1] - t[0]) / 4.0, 1e-12)
+    return (A0, gamma0, C0)
+
+# Fit E_rms
+try:
+    p0 = safe_guess_exp(E_rms_arr, t_snap)
+    popt_E, pcov_E = curve_fit(exp_decay, t_snap, E_rms_arr, p0=p0, maxfev=20000)
+    perr_E = np.sqrt(np.diag(pcov_E))
+except Exception as e:
+    popt_E, perr_E = (np.nan, np.nan, np.nan), (np.nan, np.nan, np.nan)
+    print("E_rms fit failed:", e)
+
+# Fit rho_rms
+try:
+    p0 = safe_guess_exp(rho_rms_arr, t_snap)
+    popt_rho, pcov_rho = curve_fit(exp_decay, t_snap, rho_rms_arr, p0=p0, maxfev=20000)
+    perr_rho = np.sqrt(np.diag(pcov_rho))
+except Exception as e:
+    popt_rho, perr_rho = (np.nan, np.nan, np.nan), (np.nan, np.nan, np.nan)
+    print("rho_rms fit failed:", e)
+
+# Fit neutralization (rising)
+try:
+    # initial guess: plateau near final value, start near first
+    p0_eta = (eta_arr[-1], eta_arr[0], 1.0 / max((t_snap[-1]-t_snap[0]),1e-12))
+    popt_eta, pcov_eta = curve_fit(rise_to_plateau, t_snap, eta_arr, p0=p0_eta, maxfev=20000)
+    perr_eta = np.sqrt(np.diag(pcov_eta))
+except Exception as e:
+    popt_eta, perr_eta = (np.nan, np.nan, np.nan), (np.nan, np.nan, np.nan)
+    print("eta fit failed:", e)
+
+# Print results (human readable)
+with open('dumps/fit_params.txt', 'w') as f:
+    f.write("Fit results (exp decay and rise-to-plateau)\n\n")
+    f.write("E_rms fit (A, gamma [1/s], C):\n")
+    f.write(f"  popt_E = {popt_E}\n")
+    f.write(f"  perr_E = {perr_E}\n\n")
+
+    f.write("rho_rms fit (A, gamma [1/s], C):\n")
+    f.write(f"  popt_rho = {popt_rho}\n")
+    f.write(f"  perr_rho = {perr_rho}\n\n")
+
+    f.write("eta fit (eta_inf, eta0, gamma_eta [1/s]):\n")
+    f.write(f"  popt_eta = {popt_eta}\n")
+    f.write(f"  perr_eta = {perr_eta}\n\n")
+
+    # also compute gamma in units of plasma freq if you want
+    try:
+        omega_pe  # existing in your script
+        f.write(f"\nomega_pe = {omega_pe:.6e} s^-1\n")
+        if not np.isnan(popt_E[1]):
+            f.write(f"gamma_E / omega_pe = {popt_E[1]/omega_pe:.6e}\n")
+        if not np.isnan(popt_rho[1]):
+            f.write(f"gamma_rho / omega_pe = {popt_rho[1]/omega_pe:.6e}\n")
+        if not np.isnan(popt_eta[2]):
+            f.write(f"gamma_eta / omega_pe = {popt_eta[2]/omega_pe:.6e}\n")
+    except NameError:
+        f.write("\nomega_pe not available in script namespace; skipping normalized rates.\n")
+
+print("Fit parameters saved to dumps/fit_params.txt")
+
+# Save fit arrays
+np.savez('dumps/fit_params.npz',
+         popt_E=popt_E, perr_E=perr_E,
+         popt_rho=popt_rho, perr_rho=perr_rho,
+         popt_eta=popt_eta, perr_eta=perr_eta,
+         t_snap=t_snap,
+         E_rms_arr=E_rms_arr, rho_rms_arr=rho_rms_arr, eta_arr=eta_arr)
+
+# === Optional: quick diagnostic plots comparing data with fits ===
+# E_rms plot
+plt.figure()
+plt.plot(t_snap, E_rms_arr, 'o', label='E_rms data')
+if not np.isnan(popt_E).any():
+    plt.plot(t_snap, exp_decay(t_snap, *popt_E), '-', label=f'fit γ={popt_E[1]:.3e} s^-1')
+plt.xlabel('time (s)')
+plt.ylabel('E_rms (V/m)')
+plt.legend()
+plt.savefig('plots/E_rms_fit.png', dpi=200)
+
+# rho_rms plot
+plt.figure()
+plt.plot(t_snap, rho_rms_arr, 'o', label='rho_rms data')
+if not np.isnan(popt_rho).any():
+    plt.plot(t_snap, exp_decay(t_snap, *popt_rho), '-', label=f'fit γ={popt_rho[1]:.3e} s^-1')
+plt.xlabel('time (s)')
+plt.ylabel('rho_rms (C/m^3)')
+plt.legend()
+plt.savefig('plots/rho_rms_fit.png', dpi=200)
+
+# neutralization plot
+plt.figure()
+plt.plot(t_snap, eta_arr, 'o', label='eta data')
+if not np.isnan(popt_eta).any():
+    plt.plot(t_snap, rise_to_plateau(t_snap, *popt_eta), '-', label=f'fit γ_eta={popt_eta[2]:.3e} s^-1')
+plt.xlabel('time (s)')
+plt.ylabel('neutralization metric')
+plt.legend()
+plt.savefig('plots/eta_fit.png', dpi=200)
+plt.close('all')
+
+print("Diagnostic fit plots saved to plots/*.png")
 
 plt.figure(figsize=(6,5))
 plt.imshow(rho_final.T, origin='lower', extent=[0,Lx,0,Ly])
@@ -436,12 +658,5 @@ plt.xlabel('Snapshot'); plt.ylabel('relative dE')
 plt.title('Relative energy drift (TE-TE0)/TE0')
 plt.grid(True, alpha=0.3)
 plt.tight_layout(); plt.savefig('plots/energy_drift_mag.png', dpi=300)
-
-# Save timeseries arrays to a npz for post-processing
-np.savez('dumps/timeseries.npz',
-         eta_hist=np.array(eta_hist), eta_raw_hist=np.array(eta_raw_hist),
-         Erms_hist=np.array(Erms_hist), rho_rms_hist=np.array(rho_rms_hist), overlap_hist=np.array(overlap_hist),
-         KE_hist=np.array(KE_hist), FE_hist=np.array(FE_hist), TE_hist=np.array(TE_hist),
-         dE_rel_hist=np.array(dE_rel_hist))
 
 print('Run complete. Plots saved to ./plots and metadata to plots/run_meta.txt; dumps in ./dumps')
